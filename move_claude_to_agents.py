@@ -34,6 +34,14 @@ def parse_args() -> argparse.Namespace:
         help="overwrite existing AGENTS.md files",
     )
     parser.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help=(
+            "show what would be done without changing files or running Git commands"
+        ),
+    )
+    parser.add_argument(
         "--auto-commit",
         action="store_true",
         help="commit migrated files in their nearest Git repository",
@@ -52,7 +60,7 @@ def find_claude_files(path: Path) -> list[Path]:
     return sorted(path.rglob("CLAUDE.md"))
 
 
-def migrate(claude_path: Path, *, force: bool) -> bool:
+def migrate(claude_path: Path, *, force: bool, dry_run: bool) -> bool:
     agents_path = claude_path.with_name("AGENTS.md")
 
     if agents_path.exists() and not force:
@@ -61,6 +69,10 @@ def migrate(claude_path: Path, *, force: bool) -> bool:
             file=sys.stderr,
         )
         return False
+
+    if dry_run:
+        print(f"would migrate: {claude_path} -> {agents_path}")
+        return True
 
     shutil.copy2(claude_path, agents_path)
     claude_path.write_text("@AGENTS.md", encoding="utf-8")
@@ -165,7 +177,7 @@ def main() -> int:
     claude_files = find_claude_files(path)
     for claude_path in claude_files:
         repo = find_git_repo(claude_path)
-        if not migrate(claude_path, force=args.force):
+        if not migrate(claude_path, force=args.force, dry_run=args.dry_run):
             continue
 
         if args.auto_commit or args.auto_push:
@@ -181,6 +193,11 @@ def main() -> int:
             )
 
     for repo, changed_files in migrated_by_repo.items():
+        if args.dry_run:
+            print(f"would commit: {repo}")
+            if args.auto_push:
+                print(f"would pull with rebase and push: {repo}")
+            continue
         if commit_migrations(repo, changed_files) and args.auto_push:
             push_repo(repo)
 
