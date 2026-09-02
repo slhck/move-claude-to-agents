@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Migrate CLAUDE.md files to AGENTS.md files recursively."""
+"""Migrate committed CLAUDE.md files to AGENTS.md files recursively."""
 
 from __future__ import annotations
 
@@ -17,8 +17,8 @@ COMMIT_MESSAGE = "chore: move CLAUDE.md to AGENTS.md"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Recursively copy CLAUDE.md files to AGENTS.md and replace each "
-            "migrated CLAUDE.md with an @AGENTS.md reference."
+            "Recursively copy committed CLAUDE.md files to AGENTS.md and "
+            "replace each migrated CLAUDE.md with an @AGENTS.md reference."
         )
     )
     parser.add_argument(
@@ -37,9 +37,7 @@ def parse_args() -> argparse.Namespace:
         "-n",
         "--dry-run",
         action="store_true",
-        help=(
-            "show what would be done without changing files or running Git commands"
-        ),
+        help="show what would be done without making changes",
     )
     parser.add_argument(
         "--auto-commit",
@@ -85,6 +83,23 @@ def find_git_repo(path: Path) -> Path | None:
         if (directory / ".git").exists():
             return directory
     return None
+
+
+def is_committed(repo: Path, path: Path) -> bool:
+    """Return whether path exists in the repository's current HEAD."""
+    relative_path = path.relative_to(repo).as_posix()
+    result = run_git(repo, "cat-file", "-e", f"HEAD:{relative_path}")
+    if result is None:
+        return False
+    if result.returncode == 0:
+        return True
+    if result.returncode != 128:
+        warn_git_failure(
+            repo,
+            f"check whether {relative_path} is committed",
+            result.stderr,
+        )
+    return False
 
 
 def warn_git_failure(repo: Path, action: str, detail: str) -> None:
@@ -177,17 +192,12 @@ def main() -> int:
     claude_files = find_claude_files(path)
     for claude_path in claude_files:
         repo = find_git_repo(claude_path)
+        if repo is None or not is_committed(repo, claude_path):
+            continue
         if not migrate(claude_path, force=args.force, dry_run=args.dry_run):
             continue
 
         if args.auto_commit or args.auto_push:
-            if repo is None:
-                print(
-                    f"warning: no Git repository found for {claude_path}; "
-                    "cannot auto-commit",
-                    file=sys.stderr,
-                )
-                continue
             migrated_by_repo[repo].extend(
                 [claude_path, claude_path.with_name("AGENTS.md")]
             )
