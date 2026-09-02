@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Migrate committed CLAUDE.md files to AGENTS.md files recursively."""
+"""Migrate committed CLAUDE.md files in clean main or master repositories."""
 
 from __future__ import annotations
 
@@ -17,8 +17,9 @@ COMMIT_MESSAGE = "chore: move CLAUDE.md to AGENTS.md"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Recursively copy committed CLAUDE.md files to AGENTS.md and "
-            "replace each migrated CLAUDE.md with an @AGENTS.md reference."
+            "In clean Git repositories on main or master, recursively copy "
+            "committed CLAUDE.md files to AGENTS.md and replace each migrated "
+            "CLAUDE.md with an @AGENTS.md reference."
         )
     )
     parser.add_argument(
@@ -121,6 +122,39 @@ def run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str] | None:
         return None
 
 
+def repository_is_safe_to_migrate(repo: Path) -> bool:
+    """Return whether repo is clean and checked out on main or master."""
+    branch_result = run_git(repo, "branch", "--show-current")
+    if branch_result is None:
+        return False
+    if branch_result.returncode != 0:
+        warn_git_failure(repo, "determine current branch", branch_result.stderr)
+        return False
+
+    status_result = run_git(repo, "status", "--porcelain")
+    if status_result is None:
+        return False
+    if status_result.returncode != 0:
+        warn_git_failure(repo, "check working tree status", status_result.stderr)
+        return False
+
+    branch = branch_result.stdout.strip()
+    problems: list[str] = []
+    if branch not in {"main", "master"}:
+        branch_description = f"branch '{branch}'" if branch else "detached HEAD"
+        problems.append(f"on {branch_description}, expected 'main' or 'master'")
+    if status_result.stdout:
+        problems.append("working tree is not clean")
+
+    if problems:
+        print(
+            f"warning: skipping {repo}: {'; '.join(problems)}",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
 def commit_migrations(repo: Path, changed_files: list[Path]) -> bool:
     relative_paths = sorted(
         {str(path.relative_to(repo)) for path in changed_files}
@@ -189,10 +223,15 @@ def main() -> int:
         return 2
 
     migrated_by_repo: dict[Path, list[Path]] = defaultdict(list)
+    safe_repositories: dict[Path, bool] = {}
     claude_files = find_claude_files(path)
     for claude_path in claude_files:
         repo = find_git_repo(claude_path)
         if repo is None or not is_committed(repo, claude_path):
+            continue
+        if repo not in safe_repositories:
+            safe_repositories[repo] = repository_is_safe_to_migrate(repo)
+        if not safe_repositories[repo]:
             continue
         if not migrate(claude_path, force=args.force, dry_run=args.dry_run):
             continue
