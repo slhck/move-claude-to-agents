@@ -1,4 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = [
+#   "rich>=13.7",
+# ]
+# ///
 """Migrate committed CLAUDE.md files in clean main or master repositories."""
 
 from __future__ import annotations
@@ -8,10 +14,57 @@ import shutil
 import subprocess
 import sys
 from collections import defaultdict
+from collections.abc import Iterator
 from pathlib import Path
+from typing import TypeVar
+
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
+from rich.text import Text
 
 
 COMMIT_MESSAGE = "chore: move CLAUDE.md to AGENTS.md"
+T = TypeVar("T")
+console = Console()
+error_console = Console(stderr=True, soft_wrap=True)
+
+
+def report(level: str, message: str, *, error: bool = False) -> None:
+    """Print a consistently styled, readable status message."""
+    styles = {
+        "info": "cyan",
+        "success": "green",
+        "warning": "yellow",
+        "error": "bold red",
+        "dry run": "magenta",
+    }
+    output = error_console if error else console
+    output.print(Text.assemble((f"{level}: ", styles[level]), message))
+
+
+def with_progress(items: list[T], description: str) -> Iterator[T]:
+    """Yield items while showing a live progress bar on interactive terminals."""
+    with Progress(
+        SpinnerColumn(style="cyan"),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+        disable=not console.is_terminal,
+    ) as progress:
+        task = progress.add_task(description, total=len(items))
+        for item in items:
+            yield item
+            progress.advance(task)
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,19 +116,20 @@ def migrate(claude_path: Path, *, force: bool, dry_run: bool) -> bool:
     agents_path = claude_path.with_name("AGENTS.md")
 
     if agents_path.exists() and not force:
-        print(
-            f"warning: {agents_path} already exists; skipping {claude_path}",
-            file=sys.stderr,
+        report(
+            "warning",
+            f"{agents_path} already exists; skipping {claude_path}",
+            error=True,
         )
         return False
 
     if dry_run:
-        print(f"would migrate: {claude_path} -> {agents_path}")
+        report("dry run", f"would migrate: {claude_path} -> {agents_path}")
         return True
 
     shutil.copy2(claude_path, agents_path)
     claude_path.write_text("@AGENTS.md", encoding="utf-8")
-    print(f"migrated: {claude_path} -> {agents_path}")
+    report("success", f"migrated: {claude_path} -> {agents_path}")
     return True
 
 
@@ -105,7 +159,11 @@ def is_committed(repo: Path, path: Path) -> bool:
 
 def warn_git_failure(repo: Path, action: str, detail: str) -> None:
     suffix = f": {detail.strip()}" if detail.strip() else ""
-    print(f"warning: could not {action} in {repo}{suffix}", file=sys.stderr)
+    report(
+        "warning",
+        f"could not {action} in {repo}{suffix}",
+        error=True,
+    )
 
 
 def run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str] | None:
@@ -147,9 +205,10 @@ def repository_is_safe_to_migrate(repo: Path) -> bool:
         problems.append("working tree is not clean")
 
     if problems:
-        print(
-            f"warning: skipping {repo}: {'; '.join(problems)}",
-            file=sys.stderr,
+        report(
+            "warning",
+            f"skipping {repo}: {'; '.join(problems)}",
+            error=True,
         )
         return False
     return True
@@ -170,7 +229,7 @@ def commit_migrations(repo: Path, changed_files: list[Path]) -> bool:
     if diff_result is None:
         return False
     if diff_result.returncode == 0:
-        print(f"nothing to commit in: {repo}")
+        report("info", f"nothing to commit in: {repo}")
         return True
     if diff_result.returncode != 1:
         warn_git_failure(repo, "check staged migrated files", diff_result.stderr)
@@ -191,7 +250,7 @@ def commit_migrations(repo: Path, changed_files: list[Path]) -> bool:
         warn_git_failure(repo, "commit migrated files", commit_result.stderr)
         return False
 
-    print(f"committed: {repo}")
+    report("success", f"committed: {repo}")
     return True
 
 
@@ -210,7 +269,7 @@ def push_repo(repo: Path) -> bool:
         warn_git_failure(repo, "push", push_result.stderr)
         return False
 
-    print(f"pushed: {repo}")
+    report("success", f"pushed: {repo}")
     return True
 
 
@@ -219,13 +278,26 @@ def main() -> int:
     path = args.path.expanduser().resolve()
 
     if not path.exists():
-        print(f"error: path does not exist: {path}", file=sys.stderr)
+        report("error", f"path does not exist: {path}", error=True)
         return 2
+
+    console.rule("[bold cyan]CLAUDE.md to AGENTS.md[/]")
+    report("info", f"searching from {path}")
+    if args.dry_run:
+        report("dry run", "no files will be changed")
 
     migrated_by_repo: dict[Path, list[Path]] = defaultdict(list)
     safe_repositories: dict[Path, bool] = {}
-    claude_files = find_claude_files(path)
-    for claude_path in claude_files:
+    with console.status("[bold cyan]Discovering CLAUDE.md files...[/]"):
+        claude_files = find_claude_files(path)
+
+    if not claude_files:
+        report("info", "no CLAUDE.md files found")
+        return 0
+
+    report("info", f"found {len(claude_files)} CLAUDE.md file(s)")
+    migrated_count = 0
+    for claude_path in with_progress(claude_files, "Migrating files"):
         repo = find_git_repo(claude_path)
         if repo is None or not is_committed(repo, claude_path):
             continue
@@ -235,20 +307,28 @@ def main() -> int:
             continue
         if not migrate(claude_path, force=args.force, dry_run=args.dry_run):
             continue
+        migrated_count += 1
 
         if args.auto_commit or args.auto_push:
             migrated_by_repo[repo].extend(
                 [claude_path, claude_path.with_name("AGENTS.md")]
             )
 
-    for repo, changed_files in migrated_by_repo.items():
+    repositories = list(migrated_by_repo.items())
+    for repo, changed_files in with_progress(repositories, "Finishing repositories"):
         if args.dry_run:
-            print(f"would commit: {repo}")
+            report("dry run", f"would commit: {repo}")
             if args.auto_push:
-                print(f"would pull with rebase and push: {repo}")
+                report("dry run", f"would pull with rebase and push: {repo}")
             continue
         if commit_migrations(repo, changed_files) and args.auto_push:
             push_repo(repo)
+
+    if migrated_count:
+        action = "planned" if args.dry_run else "completed"
+        report("success", f"{action}: {migrated_count} migration(s)")
+    else:
+        report("info", "no eligible files to migrate")
 
     return 0
 
